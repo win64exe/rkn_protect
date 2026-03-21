@@ -2,7 +2,7 @@
 # ================================================================
 #  rkn_protect.sh — Защита сервера от блокировок РКН/ТСПУ/DPI
 #  Совместимо с: Remnawave + VLESS + XTLS-Reality
-#  Протестировано: Ubuntu 22.04/24.04, Debian 12
+#  Протестировано: Ubuntu 22.04/24.04, Debian 12 (bookworm), Debian 13 (trixie)
 #  Запуск ПОСЛЕ установки Remnawave: sudo bash rkn_protect.sh
 # ================================================================
 set -euo pipefail
@@ -13,6 +13,23 @@ warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 [[ $EUID -ne 0 ]] && error "Запустите скрипт от root (sudo)"
+
+# Проверка совместимости ОС
+check_os() {
+  if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    case "$ID-$VERSION_CODENAME" in
+      debian-bookworm|debian-trixie|      ubuntu-jammy|ubuntu-noble|ubuntu-focal) ;;
+      *)
+        warn "Система $PRETTY_NAME не тестировалась."
+        warn "Поддерживаются: Debian 12/13, Ubuntu 20.04/22.04/24.04"
+        read -r -p "  Продолжить на свой страх и риск? [y/N]: " OSOK
+        [[ "${OSOK,,}" == "y" ]] || exit 1
+        ;;
+    esac
+  fi
+}
+check_os
 
 # ──────────────────────────────────────────────────────────────────
 # 1. SYSCTL: hardening сетевого стека
@@ -619,6 +636,113 @@ EOF
 }
 
 # ──────────────────────────────────────────────────────────────────
+# 8. SSH HARDENING
+#
+#    Закрывает типовые уязвимости sshd которые находит Lynis:
+#    PermitRootLogin, MaxAuthTries, X11Forwarding и другие.
+# ──────────────────────────────────────────────────────────────────
+harden_ssh() {
+  info "Применяю SSH hardening..."
+
+  SSHD_CONFIG="/etc/ssh/sshd_config"
+  [ -f "$SSHD_CONFIG" ] || error "Файл $SSHD_CONFIG не найден"
+
+  # Бэкап
+  cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+
+  # Функция установки/замены параметра
+  set_sshd_param() {
+    local param="$1" value="$2"
+    if grep -qE "^#?[[:space:]]*${param}[[:space:]]" "$SSHD_CONFIG"; then
+      sed -i "s|^#\?[[:space:]]*${param}[[:space:]].*|${param} ${value}|" "$SSHD_CONFIG"
+    else
+      echo "${param} ${value}" >> "$SSHD_CONFIG"
+    fi
+  }
+
+  set_sshd_param "MaxAuthTries"          "3"
+  set_sshd_param "MaxSessions"           "3"
+  set_sshd_param "X11Forwarding"         "no"
+  set_sshd_param "AllowTcpForwarding"    "no"
+  set_sshd_param "AllowAgentForwarding"  "no"
+  set_sshd_param "Compression"           "no"
+  set_sshd_param "ClientAliveCountMax"   "2"
+  set_sshd_param "ClientAliveInterval"   "300"
+  set_sshd_param "LogLevel"             "VERBOSE"
+  set_sshd_param "PrintLastLog"          "yes"
+  set_sshd_param "IgnoreRhosts"          "yes"
+  set_sshd_param "PermitEmptyPasswords"  "no"
+  set_sshd_param "LoginGraceTime"        "30"
+
+  # Проверяем конфиг перед перезапуском
+  if sshd -t 2>/dev/null; then
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+    info "SSH hardening применён"
+    echo ""
+    echo "  Применённые параметры:"
+    echo "  MaxAuthTries         3    — максимум попыток ввода пароля"
+    echo "  MaxSessions          3    — максимум одновременных сессий"
+    echo "  X11Forwarding        no   — GUI forwarding отключён"
+    echo "  AllowTcpForwarding   no   — туннели через SSH запрещены"
+    echo "  AllowAgentForwarding no   — проброс SSH-агента запрещён"
+    echo "  Compression          no   — сжатие отключено"
+    echo "  LoginGraceTime       30s  — таймаут аутентификации"
+    echo "  LogLevel             VERBOSE — детальные логи для fail2ban"
+    echo ""
+  else
+    warn "Ошибка в конфиге sshd — откатываю изменения"
+    LATEST_BAK=$(ls -t ${SSHD_CONFIG}.bak.* 2>/dev/null | head -1)
+    [ -n "$LATEST_BAK" ] && cp "$LATEST_BAK" "$SSHD_CONFIG" || true
+  fi
+}
+
+
+# ──────────────────────────────────────────────────────────────────
+# 10. ОТКЛЮЧЕНИЕ НЕИСПОЛЬЗУЕМЫХ СЕТЕВЫХ ПРОТОКОЛОВ
+#
+#    dccp, sctp, rds, tipc — экзотические протоколы которые
+#    не используются на типичном VPS-сервере, но расширяют
+#    поверхность атаки. Lynis рекомендует их отключить.
+#    Отключение через modprobe — безопасно, Docker и Remnawave
+#    используют только TCP/UDP, эти протоколы им не нужны.
+# ──────────────────────────────────────────────────────────────────
+disable_unused_protocols() {
+  info "Отключаю неиспользуемые сетевые протоколы..."
+
+  cat > /etc/modprobe.d/unused-protocols.conf << 'EOF'
+# Отключение неиспользуемых сетевых протоколов (Lynis NETW-3200)
+# Эти протоколы не нужны на VPS с Remnawave/VLESS и расширяют поверхность атаки
+
+# DCCP — Datagram Congestion Control Protocol
+install dccp /bin/false
+
+# SCTP — Stream Control Transmission Protocol
+install sctp /bin/false
+
+# RDS — Reliable Datagram Sockets (Oracle)
+install rds /bin/false
+
+# TIPC — Transparent Inter-Process Communication
+install tipc /bin/false
+EOF
+
+  # Выгружаем модули если они сейчас загружены
+  for proto in dccp sctp rds tipc; do
+    if lsmod | grep -q "^${proto}"; then
+      modprobe -r "$proto" 2>/dev/null &&         info "Модуль ${proto} выгружен" ||         warn "Не удалось выгрузить ${proto} — будет отключён после перезагрузки"
+    fi
+  done
+
+  # Обновляем initramfs чтобы изменения сохранились после перезагрузки
+  update-initramfs -u 2>/dev/null || true
+
+  echo ""
+  info "Протоколы dccp, sctp, rds, tipc отключены"
+  echo "  Проверка загруженных модулей:"
+  lsmod | grep -E "^(dccp|sctp|rds|tipc)" || echo "  Ни один из протоколов не загружен — всё чисто"
+}
+
+# ──────────────────────────────────────────────────────────────────
 # ГЛАВНОЕ МЕНЮ
 # ──────────────────────────────────────────────────────────────────
 echo ""
@@ -629,28 +753,34 @@ echo "============================================="
 echo ""
 echo "Модули защиты:"
 echo "  1) sysctl hardening (совместимо с BBR)"
-echo "  2) nftables — TTL=128 + ICMP фильтрация"
+echo "  2) nftables — TTL=128 + ICMP + ping фильтрация"
 echo "  3) Лимиты fd для Xray (много клиентов)"
-echo "  4) DNS-over-TLS (systemd-resolved)"
+echo "  4) DNS-over-TLS (stubby + Cloudflare + Quad9 + Yandex)"
 echo "  5) Fail2ban — защита от SSH брутфорса"
-echo "  6) Сменить порт SSH (рандомный 49152–65535)"
-echo "  7) Установить всё (1–5) + автозапуск"
+echo "  6) SSH hardening (Lynis рекомендации)"
+echo "  7) Отключение неиспользуемых протоколов (dccp/sctp/rds/tipc)"
+echo "  8) Сменить порт SSH (рандомный 49152–65535)"
+echo "  9) Установить всё (1–7) + автозапуск"
 echo ""
-read -r -p "Ваш выбор [1-7, Enter=7]: " CHOICE
+read -r -p "Ваш выбор [1-9, Enter=9]: " CHOICE
 
-case "${CHOICE:-7}" in
+case "${CHOICE:-9}" in
   1) apply_sysctl ;;
   2) apply_nftables ;;
   3) apply_fd_limits ;;
   4) configure_dot ;;
   5) configure_fail2ban ;;
-  6) change_ssh_port ;;
-  7|"")
+  6) harden_ssh ;;
+  7) disable_unused_protocols ;;
+  8) change_ssh_port ;;
+  9|"")
     apply_sysctl
     apply_nftables
     apply_fd_limits
     configure_dot
     configure_fail2ban
+    harden_ssh
+    disable_unused_protocols
     install_service
     echo ""
     read -r -p "  Сменить порт SSH сейчас? [y/N]: " SSH_NOW
