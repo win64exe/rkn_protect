@@ -184,10 +184,29 @@ EOF
     warn "Перезапускаю Docker для применения новых лимитов..."
     warn "Remnawave контейнеры остановятся на ~10 секунд"
     systemctl restart docker
+
+    # Ждём пока Docker полностью поднимется
+    info "Жду запуска Docker..."
+    for i in $(seq 1 15); do
+      if systemctl is-active --quiet docker 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+
     # Поднимаем обратно контейнеры Remnawave если они есть
     if [ -d /opt/remnawave ]; then
       cd /opt/remnawave && docker compose up -d > /dev/null 2>&1 || true
     fi
+
+    # Поднимаем контейнеры бота если есть
+    BOT_DIR=$(find /root /home -maxdepth 3 -name "docker-compose.yml" 2>/dev/null |       xargs grep -l "remnawave_bot" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
+    if [ -n "$BOT_DIR" ] && [ "$BOT_DIR" != "/opt/remnawave" ]; then
+      cd "$BOT_DIR" && docker compose up -d > /dev/null 2>&1 || true
+    fi
+
+    # Небольшая пауза чтобы контейнеры успели стартовать
+    sleep 5
   fi
 
   info "Лимиты файловых дескрипторов установлены (1048576)"
@@ -202,13 +221,23 @@ EOF
 #    Конфликтов нет.
 # ──────────────────────────────────────────────────────────────────
 configure_dot() {
-  info "Настраиваю DNS-over-TLS через systemd-resolved..."
+  info "Настраиваю DNS-over-TLS..."
 
+  # Определяем способ настройки DoT
+  if systemctl list-units --type=service 2>/dev/null | grep -q "systemd-resolved" ||      systemctl list-unit-files 2>/dev/null | grep -q "systemd-resolved"; then
+    _dot_via_resolved
+  else
+    info "systemd-resolved не найден — использую stubby"
+    _dot_via_stubby
+  fi
+}
+
+# DoT через systemd-resolved (Ubuntu / Debian с resolved)
+_dot_via_resolved() {
   mkdir -p /etc/systemd/resolved.conf.d
 
   cat > /etc/systemd/resolved.conf.d/dot.conf << 'EOF'
 [Resolve]
-# DoT — шифрованные DNS-запросы, защита от спуфинга РКН
 DNS=1.1.1.1#cloudflare-dns.com 9.9.9.9#dns.quad9.net
 FallbackDNS=1.0.0.1#cloudflare-dns.com 149.112.112.112#dns.quad9.net
 DNSOverTLS=yes
@@ -217,14 +246,98 @@ DNSStubListener=yes
 ReadEtcHosts=yes
 EOF
 
-  systemctl restart systemd-resolved 2>/dev/null && \
-    info "DNS-over-TLS включён (Cloudflare + Quad9)" || \
-    warn "Не удалось перезапустить systemd-resolved — проверьте вручную"
+  # Резервный resolv.conf на случай если resolved не поднимется
+  cat > /etc/resolv.conf.backup << 'EOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF
 
-  # Указываем /etc/resolv.conf на stub resolver
+  systemctl restart systemd-resolved 2>/dev/null || true
   ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
+
+  info "Проверяю DNS после применения DoT..."
+  DNS_OK=false
+  for i in $(seq 1 20); do
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null &&        getent hosts cloudflare.com > /dev/null 2>&1; then
+      DNS_OK=true
+      break
+    fi
+    sleep 1
+  done
+
+  if [ "$DNS_OK" = true ]; then
+    info "DNS-over-TLS включён через systemd-resolved (Cloudflare + Quad9)"
+    rm -f /etc/resolv.conf.backup
+  else
+    warn "systemd-resolved не ответил — восстанавливаю резервный DNS..."
+    rm -f /etc/resolv.conf
+    cp /etc/resolv.conf.backup /etc/resolv.conf
+    systemctl restart systemd-resolved 2>/dev/null || true
+    sleep 3
+    if getent hosts cloudflare.com > /dev/null 2>&1; then
+      info "DNS восстановлен"
+    else
+      warn "DNS недоступен — проверьте вручную: systemctl status systemd-resolved"
+    fi
+  fi
 }
 
+# DoT через stubby (Debian без systemd-resolved)
+_dot_via_stubby() {
+  # Устанавливаем stubby если нет
+  if ! command -v stubby &>/dev/null; then
+    # Резервный DNS на время установки
+    cat > /etc/resolv.conf << 'EOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF
+    apt-get update -qq
+    apt-get install -y stubby > /dev/null || {
+      warn "Не удалось установить stubby — DNS-over-TLS пропущен"
+      return
+    }
+  fi
+
+  cat > /etc/stubby/stubby.yml << 'EOF'
+resolution_type: GETDNS_RESOLUTION_STUB
+dns_transport_list:
+  - GETDNS_TRANSPORT_TLS
+tls_authentication: GETDNS_AUTHENTICATION_REQUIRED
+tls_query_padding_blocksize: 128
+edns_client_subnet_private: 1
+round_robin_upstreams: 1
+listen_addresses:
+  - 127.0.0.1@53
+  - 0::1@53
+upstream_recursive_servers:
+  - address_data: 1.1.1.1
+    tls_auth_name: "cloudflare-dns.com"
+  - address_data: 9.9.9.9
+    tls_auth_name: "dns.quad9.net"
+  - address_data: 1.0.0.1
+    tls_auth_name: "cloudflare-dns.com"
+  - address_data: 149.112.112.112
+    tls_auth_name: "dns.quad9.net"
+EOF
+
+  systemctl enable --now stubby > /dev/null 2>&1
+  sleep 2
+
+  # Проверяем что stubby отвечает
+  if dig +short +timeout=3 google.com @127.0.0.1 > /dev/null 2>&1; then
+    # Переключаем resolv.conf на stubby
+    cat > /etc/resolv.conf << 'EOF'
+nameserver 127.0.0.1
+EOF
+    # Защищаем от перезаписи DHCP-клиентом
+    chattr +i /etc/resolv.conf 2>/dev/null || true
+    info "DNS-over-TLS включён через stubby (Cloudflare + Quad9)"
+    info "Проверка: dig google.com @127.0.0.1"
+  else
+    warn "stubby не отвечает — оставляю текущий DNS без изменений"
+    warn "Проверьте вручную: systemctl status stubby"
+  fi
+}
 # ──────────────────────────────────────────────────────────────────
 # 5. СМЕНА ПОРТА SSH
 #
