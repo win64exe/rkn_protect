@@ -148,6 +148,11 @@ EOF
   fi
 
   systemctl enable --now nftables > /dev/null 2>&1 || true
+
+  # Удаляем старую таблицу если существует — предотвращаем задвоение правил
+  # при повторном запуске скрипта
+  nft delete table inet rkn_protect 2>/dev/null || true
+
   nft -f /etc/nftables.d/rkn-protect.nft
   info "nftables правила применены"
 }
