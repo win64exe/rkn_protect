@@ -23,7 +23,7 @@
 ## Установка
 
 ```bash
-curl -o rkn_protect.sh https://raw.githubusercontent.com/win64exe/rkn_protect/main/rkn_protect.sh
+curl -o rkn_protect.sh https://raw.githubusercontent.com/win64exe/rkn_protect/main/rkn_protect.sh](https://raw.githubusercontent.com/win64exe/rkn_protect/refs/heads/main/rkn_protect.sh
 chmod +x rkn_protect.sh
 sudo bash rkn_protect.sh
 ```
