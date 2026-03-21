@@ -126,6 +126,10 @@ table inet rkn_protect {
     tcp flags syn limit rate 200/second burst 500 packets accept
     tcp flags syn drop
 
+    # Блокируем входящий ping — скрываем сервер от сканеров
+    icmp type echo-request drop
+    icmpv6 type echo-request drop
+
     # Блокируем ICMP timestamp — используется для fingerprinting и uptime-детекции
     icmp type { timestamp-request, address-mask-request } drop
 
