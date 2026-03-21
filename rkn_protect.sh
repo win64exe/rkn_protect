@@ -326,10 +326,19 @@ upstream_recursive_servers:
 EOF
 
   systemctl enable --now stubby > /dev/null 2>&1
-  sleep 2
 
-  # Проверяем что stubby отвечает
-  if dig +short +timeout=3 google.com @127.0.0.1 > /dev/null 2>&1; then
+  # Ждём пока stubby установит TLS-соединение с upstream (до 15 секунд)
+  info "Жду запуска stubby..."
+  STUBBY_OK=false
+  for i in $(seq 1 15); do
+    if dig +short +timeout=2 google.com @127.0.0.1 > /dev/null 2>&1; then
+      STUBBY_OK=true
+      break
+    fi
+    sleep 1
+  done
+
+  if [ "$STUBBY_OK" = true ]; then
     # Переключаем resolv.conf на stubby
     cat > /etc/resolv.conf << 'EOF'
 nameserver 127.0.0.1
@@ -339,8 +348,12 @@ EOF
     info "DNS-over-TLS включён через stubby (Cloudflare + Quad9)"
     info "Проверка: dig google.com @127.0.0.1"
   else
-    warn "stubby не отвечает — оставляю текущий DNS без изменений"
-    warn "Проверьте вручную: systemctl status stubby"
+    warn "stubby не ответил вовремя — переключаю resolv.conf вручную"
+    warn "Если DNS не работает: echo nameserver 127.0.0.1 > /etc/resolv.conf"
+    # Переключаем всё равно — stubby скорее всего поднимется чуть позже
+    echo "nameserver 127.0.0.1" > /etc/resolv.conf
+    chattr +i /etc/resolv.conf 2>/dev/null || true
+    warn "Проверьте вручную: dig google.com @127.0.0.1"
   fi
 }
 # ──────────────────────────────────────────────────────────────────
