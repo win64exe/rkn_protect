@@ -336,6 +336,8 @@ listen_addresses:
   - 127.0.0.1@53
   - 0::1@53
 upstream_recursive_servers:
+  - address_data: 77.88.8.8
+    tls_auth_name: "common.dot.yandex.net"
   - address_data: 1.1.1.1
     tls_auth_name: "cloudflare-dns.com"
   - address_data: 9.9.9.9
@@ -344,10 +346,8 @@ upstream_recursive_servers:
     tls_auth_name: "cloudflare-dns.com"
   - address_data: 149.112.112.112
     tls_auth_name: "dns.quad9.net"
-  - address_data: 77.88.8.8
-    tls_auth_name: "dot.yandex.net"
   - address_data: 77.88.8.1
-    tls_auth_name: "dot.yandex.net"
+    tls_auth_name: "common.dot.yandex.net"
 EOF
 
   systemctl enable --now stubby > /dev/null 2>&1
