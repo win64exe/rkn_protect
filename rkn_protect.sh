@@ -222,7 +222,7 @@ EOF
 
     # Поднимаем обратно контейнеры Remnawave если они есть
     if [ -d /opt/remnawave ]; then
-      cd /opt/remnawave && docker compose up -d > /dev/null 2>&1 || true
+      cd /opt/remnawave && timeout 60 docker compose up -d > /dev/null 2>&1 || true
     fi
 
     # Поднимаем контейнеры бота если есть
