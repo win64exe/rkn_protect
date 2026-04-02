@@ -5,14 +5,128 @@
 #  Протестировано: Ubuntu 22.04/24.04, Debian 12 (bookworm), Debian 13 (trixie)
 #  Запуск ПОСЛЕ установки Remnawave: sudo bash rkn_protect.sh
 # ================================================================
-set -euo pipefail
+# set -euo pipefail намеренно НЕ используется:
+# многие команды возвращают ненулевой код в штатных ситуациях
+# (nft delete несуществующей таблицы, modprobe незагруженного модуля и т.д.)
+# Вместо этого — явные проверки критичных шагов через die() и run_critical()
+set -uo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-info()  { echo -e "${GREEN}[*]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-[[ $EUID -ne 0 ]] && error "Запустите скрипт от root (sudo)"
+# run_critical — выполнить команду; при ошибке — завершить скрипт
+run_critical() {
+  local desc="$1"; shift
+  if ! "$@"; then
+    die "${desc} — команда завершилась с ошибкой: $*"
+  fi
+}
+
+# ──────────────────────────────────────────────────────────────────
+# ЛОГИРОВАНИЕ
+# Все действия пишутся в /var/log/rkn-protect.log с таймстампами.
+# Вывод идёт одновременно в терминал и в лог (tee).
+# ──────────────────────────────────────────────────────────────────
+LOG_FILE="/var/log/rkn-protect.log"
+
+_log_raw() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true; }
+
+# Переопределяем info/warn/error/die — теперь они пишут и в лог
+info()  {
+  echo -e "${GREEN}[*]${NC} $*"
+  _log_raw "[INFO]  $*"
+}
+warn()  {
+  echo -e "${YELLOW}[!]${NC} $*"
+  _log_raw "[WARN]  $*"
+}
+error() {
+  echo -e "${RED}[ERROR]${NC} $*"
+  _log_raw "[ERROR] $*"
+  exit 1
+}
+die() {
+  echo -e "${RED}[FATAL]${NC} $*" >&2
+  _log_raw "[FATAL] $*"
+  exit 1
+}
+
+# Логируем старт сессии
+_log_raw "════════════════════════════════════════"
+_log_raw "Запуск rkn_protect.sh (PID=$$, USER=$(whoami 2>/dev/null || echo root))"
+
+# ──────────────────────────────────────────────────────────────────
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ──────────────────────────────────────────────────────────────────
+
+# Получить внешний IP сервера (кэшируется в переменной SERVER_IP)
+SERVER_IP=""
+get_server_ip() {
+  if [ -z "$SERVER_IP" ]; then
+    SERVER_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || \
+                curl -s --max-time 5 https://ifconfig.me 2>/dev/null || \
+                curl -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
+    _log_raw "Внешний IP сервера: ${SERVER_IP:-не определён}"
+  fi
+  echo "$SERVER_IP"
+}
+
+# ──────────────────────────────────────────────────────────────────
+# ПРОВЕРКА СОВМЕСТИМОСТИ NFTABLES
+# На старых ядрах (<4.10) nft работает в режиме iptables-legacy
+# через nf_tables — правила принимаются но не применяются.
+# Симптом: nft -f отрабатывает без ошибок, но TTL не меняется.
+# ──────────────────────────────────────────────────────────────────
+check_nftables_compat() {
+  local KERNEL_VER
+  KERNEL_VER=$(uname -r)
+  local KERNEL_MAJOR KERNEL_MINOR
+  KERNEL_MAJOR=$(echo "$KERNEL_VER" | cut -d. -f1)
+  KERNEL_MINOR=$(echo "$KERNEL_VER" | cut -d. -f2)
+
+  _log_raw "Ядро: $KERNEL_VER"
+
+  # Минимум для полноценного nftables: 4.10+
+  if [ "$KERNEL_MAJOR" -lt 4 ] || { [ "$KERNEL_MAJOR" -eq 4 ] && [ "$KERNEL_MINOR" -lt 10 ]; }; then
+    echo ""
+    warn "Ядро ${KERNEL_VER} слишком старое для полноценного nftables (нужно >= 4.10)."
+    warn "nftables может работать в режиме совместимости через iptables-legacy."
+    warn "Правила TTL и mangle могут не применяться корректно."
+    warn "Рекомендуется обновить ядро: apt-get install linux-image-amd64"
+    echo ""
+    read -r -p "  Продолжить установку nftables на старом ядре? [y/N]: " OLD_KERNEL_OK
+    [[ "${OLD_KERNEL_OK,,}" == "y" ]] || { info "nftables пропущен из-за старого ядра"; return 1; }
+  fi
+
+  # Проверяем что nft реально поддерживает mangle + TTL
+  # Пробуем создать тестовую таблицу с TTL-правилом
+  if ! nft add table inet _rkn_compat_test 2>/dev/null; then
+    warn "nft не может создать тестовую таблицу — возможно ядро без CONFIG_NF_TABLES"
+    nft delete table inet _rkn_compat_test 2>/dev/null || true
+    return 1
+  fi
+
+  local MANGLE_OK=false
+  if nft add chain inet _rkn_compat_test postrouting \
+      '{ type filter hook postrouting priority mangle; }' 2>/dev/null && \
+     nft add rule inet _rkn_compat_test postrouting 'ip ttl set 128' 2>/dev/null; then
+    MANGLE_OK=true
+  fi
+  nft delete table inet _rkn_compat_test 2>/dev/null || true
+
+  if [ "$MANGLE_OK" = false ]; then
+    echo ""
+    warn "Ядро не поддерживает nftables mangle/TTL правила."
+    warn "Вероятно, nftables работает через iptables-nft-legacy."
+    warn "TTL-манипуляция (основная функция модуля 2) работать НЕ БУДЕТ."
+    echo ""
+    read -r -p "  Продолжить установку? [y/N]: " COMPAT_OK
+    [[ "${COMPAT_OK,,}" == "y" ]] || { info "nftables пропущен из-за несовместимости"; return 1; }
+  else
+    _log_raw "nftables: mangle+TTL работает корректно (ядро ${KERNEL_VER})"
+  fi
+
+  return 0
+}
 
 # Проверка совместимости ОС
 check_os() {
@@ -43,6 +157,15 @@ check_os
 # ──────────────────────────────────────────────────────────────────
 apply_sysctl() {
   info "Применяю sysctl (hardening, совместимо с BBR/Remnawave)..."
+
+  # Идемпотентность: если параметры уже активны — пропускаем перезапись файла
+  RFC_NOW=$(sysctl -n net.ipv4.tcp_rfc1337 2>/dev/null || echo "0")
+  FWD_NOW=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "0")
+  if [ "$RFC_NOW" = "1" ] && [ "$FWD_NOW" = "1" ] && \
+     [ -f /etc/sysctl.d/99-rkn-protect.conf ]; then
+    info "sysctl уже применён (tcp_rfc1337=1, ip_forward=1) — пропускаю перезапись"
+    return 0
+  fi
 
   cat > /etc/sysctl.d/99-rkn-protect.conf << 'EOF'
 # ── Антифингерпринт TCP ─────────────────────────────────────────
@@ -117,6 +240,28 @@ apply_nftables() {
   info "Настраиваю nftables (TTL=128, ICMP фильтры, совместимо с Remnawave)..."
 
   command -v nft &>/dev/null || { apt-get install -y nftables > /dev/null; }
+
+  # ── Проверка совместимости ядра с nftables ────────────────────────
+  check_nftables_compat || return 0
+
+  # ── Проверка конфликта с UFW ──────────────────────────────────────
+  # UFW и nftables используют разные бэкенды (iptables vs nft).
+  # Совместная работа без явной интеграции может привести к тому,
+  # что правила одного инструмента перекрывают правила другого.
+  if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    echo ""
+    warn "Обнаружен активный UFW!"
+    warn "UFW использует iptables/xtables, nftables работает независимо от него."
+    warn "Конфликта правил нет (разные цепочки), НО:"
+    warn "  • UFW не видит и не управляет правилами nftables"
+    warn "  • После reboot UFW поднимается раньше и может перекрыть nftables-правила"
+    warn "  • Рекомендуется: либо оставить только UFW, либо только nftables"
+    echo ""
+    read -r -p "  Продолжить установку nftables рядом с UFW? [y/N]: " UFW_OK
+    [[ "${UFW_OK,,}" == "y" ]] || { info "nftables пропущен"; return; }
+    echo ""
+  fi
+
   mkdir -p /etc/nftables.d
 
   cat > /etc/nftables.d/rkn-protect.nft << 'EOF'
@@ -187,6 +332,15 @@ EOF
 apply_fd_limits() {
   info "Настраиваю лимиты файловых дескрипторов для Xray..."
 
+  # Идемпотентность: проверяем что лимиты уже выставлены
+  DOCKER_LIMIT_NOW=$(grep "LimitNOFILE" /etc/systemd/system/docker.service.d/limits.conf \
+    2>/dev/null | awk -F= '{print $2}')
+  if [ "${DOCKER_LIMIT_NOW}" = "1048576" ] && \
+     grep -q "root hard nofile 1048576" /etc/security/limits.d/99-xray.conf 2>/dev/null; then
+    info "fd limits уже настроены (1048576) — пропускаю"
+    return 0
+  fi
+
   cat > /etc/security/limits.d/99-xray.conf << 'EOF'
 *    soft nofile 1048576
 *    hard nofile 1048576
@@ -209,26 +363,42 @@ EOF
   if systemctl is-active --quiet docker 2>/dev/null; then
     warn "Перезапускаю Docker для применения новых лимитов..."
     warn "Remnawave контейнеры остановятся на ~10 секунд"
-    systemctl restart docker
+
+    # timeout 60 — защита от зависания при остановке контейнеров с restart:always
+    if ! timeout 60 systemctl restart docker; then
+      warn "Docker не перезапустился за 60 секунд — принудительная остановка..."
+      systemctl kill docker 2>/dev/null || true
+      sleep 2
+      systemctl start docker || die "Не удалось запустить Docker после принудительной остановки"
+    fi
 
     # Ждём пока Docker полностью поднимется
     info "Жду запуска Docker..."
+    DOCKER_UP=false
     for i in $(seq 1 15); do
       if systemctl is-active --quiet docker 2>/dev/null; then
+        DOCKER_UP=true
         break
       fi
       sleep 1
     done
 
+    if [ "$DOCKER_UP" = false ]; then
+      die "Docker не поднялся за 15 секунд после перезапуска. Проверьте: systemctl status docker"
+    fi
+
     # Поднимаем обратно контейнеры Remnawave если они есть
     if [ -d /opt/remnawave ]; then
-      cd /opt/remnawave && timeout 60 docker compose up -d > /dev/null 2>&1 || true
+      cd /opt/remnawave && timeout 60 docker compose up -d > /dev/null 2>&1 || \
+        warn "docker compose up /opt/remnawave завершился с ошибкой — проверьте вручную"
     fi
 
     # Поднимаем контейнеры бота если есть
-    BOT_DIR=$(find /root /home -maxdepth 3 -name "docker-compose.yml" 2>/dev/null |       xargs grep -l "remnawave_bot" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
+    BOT_DIR=$(find /root /home -maxdepth 3 -name "docker-compose.yml" 2>/dev/null | \
+      xargs grep -l "remnawave_bot" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
     if [ -n "$BOT_DIR" ] && [ "$BOT_DIR" != "/opt/remnawave" ]; then
-      cd "$BOT_DIR" && docker compose up -d > /dev/null 2>&1 || true
+      cd "$BOT_DIR" && timeout 60 docker compose up -d > /dev/null 2>&1 || \
+        warn "docker compose up $BOT_DIR завершился с ошибкой — проверьте вручную"
     fi
 
     # Небольшая пауза чтобы контейнеры успели стартовать
@@ -248,6 +418,20 @@ EOF
 # ──────────────────────────────────────────────────────────────────
 configure_dot() {
   info "Настраиваю DNS-over-TLS..."
+
+  # Идемпотентность: если DoT уже настроен и работает — пропускаем
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null && \
+     [ -f /etc/systemd/resolved.conf.d/dot.conf ]; then
+    TLS_ON=$(resolvectl status 2>/dev/null | grep -i "DNSOverTLS" | grep -i "yes" || true)
+    if [ -n "$TLS_ON" ]; then
+      info "DNS-over-TLS уже активен (systemd-resolved) — пропускаю"
+      return 0
+    fi
+  elif systemctl is-active --quiet stubby 2>/dev/null && \
+       grep -q "127.0.0.1" /etc/resolv.conf 2>/dev/null; then
+    info "DNS-over-TLS уже активен (stubby) — пропускаю"
+    return 0
+  fi
 
   # Определяем способ настройки DoT
   if systemctl list-units --type=service 2>/dev/null | grep -q "systemd-resolved" ||      systemctl list-unit-files 2>/dev/null | grep -q "systemd-resolved"; then
@@ -294,6 +478,36 @@ EOF
   if [ "$DNS_OK" = true ]; then
     info "DNS-over-TLS включён через systemd-resolved (Cloudflare + Quad9)"
     rm -f /etc/resolv.conf.backup
+
+    # Проверяем что DNS реально идёт через TLS, а не просто отвечает
+    # resolvectl query показывает "DNSOverTLS: yes" если соединение зашифровано
+    echo ""
+    info "Проверяю что запросы идут через TLS (не просто DNS)..."
+    if command -v resolvectl &>/dev/null; then
+      TLS_STATUS=$(resolvectl query cloudflare.com 2>&1 | grep -i "via" || true)
+      TLS_FLAGS=$(resolvectl status 2>/dev/null | grep -i "DNSOverTLS\|DNS Over TLS" || true)
+      if echo "$TLS_FLAGS" | grep -qi "yes"; then
+        info "✓ TLS подтверждён: resolvectl сообщает DNSOverTLS: yes"
+      else
+        warn "resolvectl не подтверждает TLS — возможно resolved не поддерживает DoT на этой версии"
+        warn "Проверьте вручную: resolvectl status | grep -i tls"
+        warn "Требуется systemd >= 237. Текущая версия: $(systemctl --version | head -1)"
+      fi
+    else
+      # resolvectl нет — пробуем через openssl: проверяем порт 853 (DNS-over-TLS)
+      if command -v openssl &>/dev/null; then
+        if echo | timeout 5 openssl s_client -connect 1.1.1.1:853 -servername cloudflare-dns.com \
+            > /dev/null 2>&1; then
+          info "✓ TLS подтверждён: порт 853 (DoT) на 1.1.1.1 доступен и отвечает"
+        else
+          warn "Порт 853 недоступен — DoT может быть заблокирован провайдером/хостером"
+          warn "DNS работает, но возможно через plaintext UDP/53"
+        fi
+      else
+        warn "resolvectl и openssl недоступны — проверьте TLS вручную"
+        warn "Команда: echo | openssl s_client -connect 1.1.1.1:853 -servername cloudflare-dns.com"
+      fi
+    fi
   else
     warn "systemd-resolved не ответил — восстанавливаю резервный DNS..."
     rm -f /etc/resolv.conf
@@ -368,16 +582,53 @@ EOF
     cat > /etc/resolv.conf << 'EOF'
 nameserver 127.0.0.1
 EOF
-    # Защищаем от перезаписи DHCP-клиентом
-    chattr +i /etc/resolv.conf 2>/dev/null || true
+    # Защищаем от перезаписи DHCP-клиентом — через NetworkManager или dhclient hook,
+    # НЕ через chattr +i (он блокирует файл для systemd/apt/обновлений системы)
+    if [ -d /etc/NetworkManager/conf.d ]; then
+      cat > /etc/NetworkManager/conf.d/no-dns.conf << 'EOF'
+[main]
+dns=none
+EOF
+      systemctl reload NetworkManager 2>/dev/null || true
+      info "NetworkManager: управление DNS передано stubby"
+    elif [ -f /etc/dhcp/dhclient-enter-hooks.d ] || [ -d /etc/dhcp/dhclient-enter-hooks.d ]; then
+      cat > /etc/dhcp/dhclient-enter-hooks.d/nodnsupdate << 'EOF'
+#!/bin/sh
+# Запрещаем dhclient перезаписывать resolv.conf (используется stubby)
+make_resolv_conf() { :; }
+EOF
+      chmod +x /etc/dhcp/dhclient-enter-hooks.d/nodnsupdate
+      info "dhclient: защита resolv.conf через hook установлена"
+    else
+      warn "Не найден NetworkManager и dhclient — resolv.conf может быть перезаписан DHCP"
+      warn "Для защиты вручную: добавьте 'dns=none' в /etc/NetworkManager/conf.d/no-dns.conf"
+    fi
     info "DNS-over-TLS включён через stubby (Cloudflare + Quad9)"
     info "Проверка: dig google.com @127.0.0.1"
+
+    # Проверяем что stubby реально использует TLS (порт 853), а не plaintext
+    echo ""
+    info "Проверяю TLS-соединение stubby с upstream..."
+    if command -v openssl &>/dev/null; then
+      if echo | timeout 5 openssl s_client -connect 1.1.1.1:853 -servername cloudflare-dns.com \
+          > /dev/null 2>&1; then
+        info "✓ TLS подтверждён: порт 853 (DoT) на Cloudflare доступен"
+      else
+        warn "Порт 853 (DoT) недоступен с этого сервера — stubby работает, но возможно без TLS"
+        warn "Проверьте: echo | openssl s_client -connect 1.1.1.1:853 -servername cloudflare-dns.com"
+      fi
+    else
+      # openssl нет — проверяем через ss что stubby слушает на 53
+      if ss -tuln | grep -q ":53 "; then
+        info "stubby слушает порт 53 — DNS работает"
+        warn "Установите openssl для проверки TLS: apt-get install -y openssl"
+      fi
+    fi
   else
     warn "stubby не ответил вовремя — переключаю resolv.conf вручную"
     warn "Если DNS не работает: echo nameserver 127.0.0.1 > /etc/resolv.conf"
     # Переключаем всё равно — stubby скорее всего поднимется чуть позже
     echo "nameserver 127.0.0.1" > /etc/resolv.conf
-    chattr +i /etc/resolv.conf 2>/dev/null || true
     warn "Проверьте вручную: dig google.com @127.0.0.1"
   fi
 }
@@ -427,7 +678,48 @@ change_ssh_port() {
   read -r -p "  Продолжить? [y/N]: " CONFIRM
   [[ "${CONFIRM,,}" == "y" ]] || { info "Смена порта отменена"; return; }
 
-  # 1. Открываем новый порт в UFW заранее — на случай ошибок не теряем доступ
+  # 0. Проверяем доступность нового порта снаружи через внешний сервис
+  #    Это защищает от ситуации когда хостер блокирует все порты кроме стандартных.
+  echo ""
+  info "Проверяю доступность порта ${NEW_PORT} снаружи..."
+  SERVER_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || \
+              curl -s --max-time 5 https://ifconfig.me 2>/dev/null || true)
+
+  PORT_REACHABLE=false
+  if [ -n "$SERVER_IP" ]; then
+    # Открываем порт временно на localhost для проверки
+    if command -v nc &>/dev/null; then
+      # Запускаем netcat как сервер на новом порту на 8 секунд
+      nc -l -p "${NEW_PORT}" > /dev/null 2>&1 &
+      NC_PID=$!
+      sleep 1
+      # Проверяем через внешний сервис portchecker
+      CHECK_RESULT=$(curl -s --max-time 7 \
+        "https://portchecker.co/api/v1/query" \
+        -H "Content-Type: application/json" \
+        -d "{\"host\":\"${SERVER_IP}\",\"ports\":[${NEW_PORT}]}" 2>/dev/null || true)
+      kill $NC_PID 2>/dev/null || true
+      if echo "$CHECK_RESULT" | grep -q '"isOpen":true'; then
+        PORT_REACHABLE=true
+        info "✓ Порт ${NEW_PORT} доступен снаружи"
+      fi
+    fi
+  fi
+
+  if [ "$PORT_REACHABLE" = false ]; then
+    echo ""
+    warn "Не удалось подтвердить что порт ${NEW_PORT} доступен снаружи."
+    warn "Возможные причины:"
+    warn "  • Хостер блокирует нестандартные порты на уровне своего firewall"
+    warn "  • Нет доступа к интернету для проверки (curl недоступен)"
+    warn "  • Инструмент проверки временно недоступен"
+    echo ""
+    warn "РИСК: если порт закрыт на хостере — вы потеряете SSH-доступ!"
+    warn "Перед сменой порта откройте его в панели управления хостера."
+    echo ""
+    read -r -p "  Всё равно сменить порт? [y/N]: " FORCE_CONFIRM
+    [[ "${FORCE_CONFIRM,,}" == "y" ]] || { info "Смена порта отменена"; return; }
+  fi
   if command -v ufw &>/dev/null; then
     ufw allow "${NEW_PORT}/tcp" comment 'SSH new port' > /dev/null
     info "UFW: порт ${NEW_PORT}/tcp открыт"
@@ -465,13 +757,17 @@ change_ssh_port() {
     ufw reload > /dev/null 2>&1 || true
   fi
 
+  # Получаем реальный IP (уже был запрошен при проверке порта, берём из кэша)
+  DISPLAY_IP=$(get_server_ip)
+  DISPLAY_IP=${DISPLAY_IP:-YOUR_SERVER_IP}
+
   echo ""
   echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
   echo -e "${GREEN}║         SSH порт успешно изменён!                ║${NC}"
   echo -e "${GREEN}╠══════════════════════════════════════════════════╣${NC}"
   echo -e "${GREEN}║  Новый порт : ${YELLOW}${NEW_PORT}${GREEN}                              ║${NC}"
   echo -e "${GREEN}║  Подключение:                                    ║${NC}"
-  echo -e "${GREEN}║  ${YELLOW}ssh -p ${NEW_PORT} user@YOUR_SERVER_IP${GREEN}           ║${NC}"
+  echo -e "${GREEN}║  ${YELLOW}ssh -p ${NEW_PORT} user@${DISPLAY_IP}${GREEN}    ║${NC}"
   echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
   echo ""
   warn "Сохраните новый порт! Текущая сессия ещё активна на порту ${CURRENT_PORT}"
@@ -553,6 +849,19 @@ configure_fail2ban() {
     F2B_LOGPATH='logpath = /var/log/auth.log'
   fi
 
+  # Определяем banaction: если nftables активен — используем его бэкенд,
+  # иначе падаем на iptables-multiport (стандартный).
+  # Смешивать нельзя: fail2ban должен банить через тот же фреймворк что управляет пакетами.
+  if command -v nft &>/dev/null && systemctl is-active --quiet nftables 2>/dev/null; then
+    F2B_BANACTION="nftables-multiport"
+    F2B_BANACTION_ALLPORTS="nftables-allports"
+    info "Fail2ban: используем nftables-бэкенд (совместимо с модулем 2)"
+  else
+    F2B_BANACTION="iptables-multiport"
+    F2B_BANACTION_ALLPORTS="iptables-allports"
+    info "Fail2ban: используем iptables-бэкенд"
+  fi
+
   # Создаём jail.local — он имеет приоритет над jail.conf
   # и не перезаписывается при обновлении пакета
   cat > /etc/fail2ban/jail.local << EOF
@@ -571,6 +880,11 @@ bantime   = 3600
 
 # Бэкенд получения логов
 backend = ${F2B_BACKEND}
+
+# Бэкенд бана — nftables или iptables (определяется автоматически выше)
+# Важно: должен совпадать с фреймворком управления пакетами на сервере
+banaction = ${F2B_BANACTION}
+banaction_allports = ${F2B_BANACTION_ALLPORTS}
 
 # Уведомления по email (опционально — закомментировано)
 # destemail = root@localhost
@@ -647,6 +961,16 @@ harden_ssh() {
   SSHD_CONFIG="/etc/ssh/sshd_config"
   [ -f "$SSHD_CONFIG" ] || error "Файл $SSHD_CONFIG не найден"
 
+  # Предупреждение: AllowTcpForwarding no ломает SSH-туннели
+  echo ""
+  warn "SSH hardening отключит AllowTcpForwarding и AllowAgentForwarding."
+  warn "Это СЛОМАЕТ SSH-туннели (например: ssh -L, -R, -D, WireGuard-over-SSH)."
+  warn "Если вы используете SSH для проброса портов — ответьте 'n' и пропустите этот модуль."
+  echo ""
+  read -r -p "  Продолжить? [y/N]: " SSH_HARDEN_OK
+  [[ "${SSH_HARDEN_OK,,}" == "y" ]] || { info "SSH hardening пропущен"; return; }
+  echo ""
+
   # Бэкап
   cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
 
@@ -709,6 +1033,14 @@ harden_ssh() {
 disable_unused_protocols() {
   info "Отключаю неиспользуемые сетевые протоколы..."
 
+  # Идемпотентность: если modprobe-конфиг уже стоит и ни один протокол не загружен
+  BLOCKED=$(grep -c "install .* /bin/false" /etc/modprobe.d/unused-protocols.conf 2>/dev/null || echo "0")
+  LOADED=$(lsmod 2>/dev/null | grep -cE "^(dccp|sctp|rds|tipc)" || echo "0")
+  if [ "$BLOCKED" -ge 4 ] && [ "$LOADED" = "0" ]; then
+    info "Протоколы уже отключены — пропускаю"
+    return 0
+  fi
+
   cat > /etc/modprobe.d/unused-protocols.conf << 'EOF'
 # Отключение неиспользуемых сетевых протоколов (Lynis NETW-3200)
 # Эти протоколы не нужны на VPS с Remnawave/VLESS и расширяют поверхность атаки
@@ -743,6 +1075,202 @@ EOF
 }
 
 # ──────────────────────────────────────────────────────────────────
+# ПРОВЕРКА СТАТУСА ВСЕХ МОДУЛЕЙ
+# ──────────────────────────────────────────────────────────────────
+status_check() {
+  local OK="${GREEN}✓${NC}" FAIL="${RED}✗${NC}" WARN="${YELLOW}~${NC}"
+  echo ""
+  echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
+  echo -e "${GREEN}║         RKN Protect — статус модулей                ║${NC}"
+  echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
+  echo ""
+
+  # 1. sysctl
+  RFC=$(sysctl -n net.ipv4.tcp_rfc1337 2>/dev/null)
+  FWD=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+  if [ "$RFC" = "1" ] && [ "$FWD" = "1" ]; then
+    echo -e "  ${OK} sysctl       tcp_rfc1337=1, ip_forward=1"
+  elif [ -f /etc/sysctl.d/99-rkn-protect.conf ]; then
+    echo -e "  ${WARN} sysctl       конфиг есть, но не применён (rfc1337=${RFC:-?})"
+  else
+    echo -e "  ${FAIL} sysctl       не настроен"
+  fi
+
+  # 2. nftables
+  if nft list table inet rkn_protect > /dev/null 2>&1; then
+    TTL_RULE=$(nft list table inet rkn_protect 2>/dev/null | grep -c "ttl set 128" || true)
+    echo -e "  ${OK} nftables     таблица rkn_protect активна (TTL-правил: ${TTL_RULE})"
+  elif [ -f /etc/nftables.d/rkn-protect.nft ]; then
+    echo -e "  ${WARN} nftables     конфиг есть, таблица не загружена"
+  else
+    echo -e "  ${FAIL} nftables     не настроен"
+  fi
+
+  # 3. fd limits
+  DOCKER_LIMIT=$(cat /etc/systemd/system/docker.service.d/limits.conf 2>/dev/null | \
+    grep LimitNOFILE | awk -F= '{print $2}')
+  SYS_LIMIT=$(cat /etc/security/limits.d/99-xray.conf 2>/dev/null | \
+    grep "root hard" | awk '{print $4}')
+  if [ "${DOCKER_LIMIT}" = "1048576" ] && [ "${SYS_LIMIT}" = "1048576" ]; then
+    echo -e "  ${OK} fd limits    nofile=1048576 (Docker + system)"
+  elif [ -n "$DOCKER_LIMIT" ] || [ -n "$SYS_LIMIT" ]; then
+    echo -e "  ${WARN} fd limits    частично настроен (docker=${DOCKER_LIMIT:-нет}, system=${SYS_LIMIT:-нет})"
+  else
+    echo -e "  ${FAIL} fd limits    не настроен"
+  fi
+
+  # 4. DNS-over-TLS
+  DNS_METHOD=""
+  DNS_TLS_OK=false
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    TLS_FLAG=$(resolvectl status 2>/dev/null | grep -i "DNSOverTLS" | grep -i "yes" || true)
+    [ -n "$TLS_FLAG" ] && DNS_TLS_OK=true
+    DNS_METHOD="systemd-resolved"
+  elif systemctl is-active --quiet stubby 2>/dev/null; then
+    DNS_METHOD="stubby"
+    # Проверяем что resolv.conf указывает на 127.0.0.1
+    grep -q "127.0.0.1" /etc/resolv.conf 2>/dev/null && DNS_TLS_OK=true
+  fi
+  if [ "$DNS_TLS_OK" = true ]; then
+    echo -e "  ${OK} DNS-over-TLS ${DNS_METHOD} активен, TLS подтверждён"
+  elif [ -n "$DNS_METHOD" ]; then
+    echo -e "  ${WARN} DNS-over-TLS ${DNS_METHOD} запущен, TLS не подтверждён"
+  else
+    echo -e "  ${FAIL} DNS-over-TLS не настроен"
+  fi
+
+  # 5. Fail2ban
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    BANNED=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | \
+      awk -F: '{print $2}' | xargs || echo "?")
+    BANACT=$(grep "^banaction" /etc/fail2ban/jail.local 2>/dev/null | awk '{print $3}' || echo "default")
+    echo -e "  ${OK} fail2ban     активен, забанено: ${BANNED}, бэкенд: ${BANACT}"
+  elif command -v fail2ban-client &>/dev/null; then
+    echo -e "  ${WARN} fail2ban     установлен, но не запущен"
+  else
+    echo -e "  ${FAIL} fail2ban     не установлен"
+  fi
+
+  # 6. SSH hardening
+  SSH_CFG="/etc/ssh/sshd_config"
+  SSH_PORT_NOW=$(grep -E "^Port " "$SSH_CFG" 2>/dev/null | awk '{print $2}' || echo "22")
+  MAX_AUTH=$(grep -E "^MaxAuthTries" "$SSH_CFG" 2>/dev/null | awk '{print $2}' || echo "-")
+  X11=$(grep -E "^X11Forwarding" "$SSH_CFG" 2>/dev/null | awk '{print $2}' || echo "-")
+  if [ "$MAX_AUTH" = "3" ] && [ "$X11" = "no" ]; then
+    echo -e "  ${OK} SSH          порт=${SSH_PORT_NOW}, MaxAuthTries=3, X11=no"
+  elif [ "$MAX_AUTH" != "-" ]; then
+    echo -e "  ${WARN} SSH          порт=${SSH_PORT_NOW}, hardening частичный (MaxAuthTries=${MAX_AUTH})"
+  else
+    echo -e "  ${FAIL} SSH          hardening не применён (порт=${SSH_PORT_NOW})"
+  fi
+
+  # 7. Неиспользуемые протоколы
+  PROTOS_BLOCKED=$(grep -c "install .* /bin/false" /etc/modprobe.d/unused-protocols.conf 2>/dev/null || echo "0")
+  PROTOS_LOADED=$(lsmod 2>/dev/null | grep -cE "^(dccp|sctp|rds|tipc)" || echo "0")
+  if [ "$PROTOS_BLOCKED" -ge 4 ] && [ "$PROTOS_LOADED" = "0" ]; then
+    echo -e "  ${OK} протоколы    dccp/sctp/rds/tipc отключены, ни один не загружен"
+  elif [ "$PROTOS_BLOCKED" -ge 4 ]; then
+    echo -e "  ${WARN} протоколы    отключены в modprobe, загружено модулей: ${PROTOS_LOADED}"
+  else
+    echo -e "  ${FAIL} протоколы    не отключены"
+  fi
+
+  # systemd сервис
+  if systemctl is-enabled --quiet rkn-protect.service 2>/dev/null; then
+    SVC_STATE=$(systemctl is-active rkn-protect.service 2>/dev/null || echo "inactive")
+    echo -e "  ${OK} автозапуск   rkn-protect.service включён (${SVC_STATE})"
+  else
+    echo -e "  ${FAIL} автозапуск   rkn-protect.service не установлен"
+  fi
+
+  echo ""
+}
+
+# ──────────────────────────────────────────────────────────────────
+# ОТКАТ ИЗМЕНЕНИЙ
+# ──────────────────────────────────────────────────────────────────
+rollback() {
+  echo ""
+  echo -e "${RED}╔══════════════════════════════════════════════════════╗${NC}"
+  echo -e "${RED}║              Откат изменений RKN Protect            ║${NC}"
+  echo -e "${RED}╚══════════════════════════════════════════════════════╝${NC}"
+  echo ""
+  echo "  Выберите что откатить:"
+  echo "  1) nftables — удалить таблицу rkn_protect (немедленно)"
+  echo "  2) sysctl   — удалить /etc/sysctl.d/99-rkn-protect.conf"
+  echo "  3) SSH      — восстановить последний бэкап sshd_config"
+  echo "  4) Fail2ban — остановить и удалить jail.local"
+  echo "  5) Сервис   — отключить rkn-protect.service"
+  echo "  6) Всё      — полный откат всех модулей"
+  echo "  0) Отмена"
+  echo ""
+  read -r -p "  Ваш выбор: " RB_CHOICE
+
+  case "${RB_CHOICE}" in
+    1|6)
+      nft delete table inet rkn_protect 2>/dev/null && \
+        info "nftables: таблица rkn_protect удалена" || \
+        warn "nftables: таблица не найдена (уже удалена?)"
+      # Убираем include из nftables.conf
+      if [ -f /etc/nftables.conf ]; then
+        sed -i '/rkn-protect/d' /etc/nftables.conf
+        info "nftables: include удалён из /etc/nftables.conf"
+      fi
+      rm -f /etc/nftables.d/rkn-protect.nft
+      ;;&
+    2|6)
+      if [ -f /etc/sysctl.d/99-rkn-protect.conf ]; then
+        rm -f /etc/sysctl.d/99-rkn-protect.conf
+        sysctl --system > /dev/null 2>&1 || true
+        info "sysctl: 99-rkn-protect.conf удалён, параметры перезагружены"
+      else
+        warn "sysctl: файл не найден"
+      fi
+      ;;&
+    3|6)
+      SSHD_CONFIG="/etc/ssh/sshd_config"
+      LATEST_BAK=$(ls -t "${SSHD_CONFIG}".bak.* 2>/dev/null | head -1)
+      if [ -n "$LATEST_BAK" ]; then
+        cp "$LATEST_BAK" "$SSHD_CONFIG"
+        if sshd -t 2>/dev/null; then
+          systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+          info "SSH: восстановлен из ${LATEST_BAK}, sshd перезапущен"
+        else
+          warn "SSH: бэкап скопирован, но sshd -t вернул ошибку — проверьте вручную"
+        fi
+      else
+        warn "SSH: бэкапов sshd_config не найдено"
+      fi
+      ;;&
+    4|6)
+      if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        systemctl stop fail2ban
+        info "fail2ban: остановлен"
+      fi
+      rm -f /etc/fail2ban/jail.local
+      info "fail2ban: jail.local удалён"
+      ;;&
+    5|6)
+      if systemctl is-enabled --quiet rkn-protect.service 2>/dev/null; then
+        systemctl disable --now rkn-protect.service > /dev/null 2>&1 || true
+        rm -f /etc/systemd/system/rkn-protect.service
+        systemctl daemon-reload
+        info "сервис: rkn-protect.service отключён и удалён"
+      else
+        warn "сервис: не установлен"
+      fi
+      ;;&
+    0)
+      info "Откат отменён"
+      ;;
+    *)
+      warn "Неверный выбор"
+      ;;
+  esac
+  echo ""
+}
+
+# ──────────────────────────────────────────────────────────────────
 # ГЛАВНОЕ МЕНЮ
 # ──────────────────────────────────────────────────────────────────
 echo ""
@@ -761,15 +1289,42 @@ echo "  6) SSH hardening (Lynis рекомендации)"
 echo "  7) Отключение неиспользуемых протоколов (dccp/sctp/rds/tipc)"
 echo "  8) Сменить порт SSH (рандомный 49152–65535)"
 echo "  9) Установить всё (1–7) + автозапуск"
+echo " 10) Статус всех модулей"
+echo " 11) Откат изменений"
 echo ""
-read -r -p "Ваш выбор [1-9, Enter=9]: " CHOICE
+read -r -p "Ваш выбор [1-11, Enter=9]: " CHOICE
+_log_raw "Выбор пользователя: ${CHOICE:-9}"
 
 case "${CHOICE:-9}" in
   1) apply_sysctl ;;
   2) apply_nftables ;;
   3) apply_fd_limits ;;
   4) configure_dot ;;
-  5) configure_fail2ban ;;
+  5)
+    echo ""
+    echo "  5) Fail2ban:"
+    echo "     a) Установить / настроить"
+    echo "     b) Статус (активные баны, jail sshd)"
+    echo ""
+    read -r -p "  Ваш выбор [a/b]: " F2B_CHOICE
+    case "${F2B_CHOICE,,}" in
+      b)
+        echo ""
+        if ! systemctl is-active --quiet fail2ban 2>/dev/null; then
+          warn "Fail2ban не запущен. Выберите пункт 5a для настройки."
+        else
+          fail2ban-client status sshd 2>/dev/null || warn "Jail sshd недоступен — проверьте: fail2ban-client status"
+          echo ""
+          echo -e "${GREEN}── Последние баны ─────────────────────────────────${NC}"
+          grep "Ban " /var/log/fail2ban.log 2>/dev/null | tail -10 || echo "  Лог пуст"
+          echo ""
+          echo "  fail2ban-client set sshd unbanip <IP>  — разбанить IP"
+          echo "  tail -f /var/log/fail2ban.log          — живой лог"
+        fi
+        ;;
+      *) configure_fail2ban ;;
+    esac
+    ;;
   6) harden_ssh ;;
   7) disable_unused_protocols ;;
   8) change_ssh_port ;;
@@ -786,6 +1341,8 @@ case "${CHOICE:-9}" in
     read -r -p "  Сменить порт SSH сейчас? [y/N]: " SSH_NOW
     [[ "${SSH_NOW,,}" == "y" ]] && change_ssh_port
     ;;
+  10) status_check ;;
+  11) rollback ;;
   *) error "Неверный выбор" ;;
 esac
 
@@ -798,3 +1355,17 @@ echo "  resolvectl status                 — статус DNS-over-TLS"
 echo "  sysctl net.ipv4.tcp_rfc1337       — должно быть = 1"
 echo "  curl -s https://ipleak.net/json/  — проверка утечек"
 echo ""
+
+# Показываем реальный IP для удобства
+_FINAL_IP=$(get_server_ip)
+if [ -n "$_FINAL_IP" ]; then
+  SSH_PORT_FINAL=$(grep -E "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1)
+  SSH_PORT_FINAL=${SSH_PORT_FINAL:-22}
+  echo -e "  ${GREEN}Подключение к серверу:${NC}"
+  echo -e "  ${YELLOW}ssh -p ${SSH_PORT_FINAL} user@${_FINAL_IP}${NC}"
+  echo ""
+fi
+
+echo "  Лог выполнения: ${LOG_FILE}"
+echo ""
+_log_raw "Скрипт завершён (выбор: ${CHOICE:-9})"
